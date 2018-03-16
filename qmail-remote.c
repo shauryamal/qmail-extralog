@@ -29,6 +29,9 @@
 #include "timeoutread.h"
 #include "timeoutwrite.h"
 
+#include <string.h>
+#define strnicmp strncasecmp
+
 #define HUGESMTPTEXT 5000
 
 #define PORT_SMTP 25 /* silly rabbit, /etc/services is for users */
@@ -130,6 +133,7 @@ char smtpfrombuf[128];
 substdio smtpfrom = SUBSTDIO_FDBUF(saferead,-1,smtpfrombuf,sizeof smtpfrombuf);
 
 stralloc smtptext = {0};
+stralloc logtext = {0};
 
 void get(ch)
 char *ch;
@@ -166,6 +170,14 @@ unsigned long smtpcode()
 void outsmtptext()
 {
   int i; 
+  if (logtext.s) if (logtext.len) {
+    out("Qmail extra log: ");
+    for (i = 0;i < logtext.len;++i)
+      if (!logtext.s[i]) logtext.s[i] = '?';
+    if (substdio_put(subfdoutsmall,logtext.s,logtext.len) == -1) _exit(0);
+    logtext.len = 0;
+  }
+  out("/");
   if (smtptext.s) if (smtptext.len) {
     out("Remote host said: ");
     for (i = 0;i < smtptext.len;++i)
@@ -193,22 +205,98 @@ void blast()
 {
   int r;
   char ch;
+  int cnt, in_headers = 1;
 
   for (;;) {
+    cnt = 0;    // initialize to 0 the count of characters written from the current line
     r = substdio_get(&ssin,&ch,1);
     if (r == 0) break;
     if (r == -1) temp_read();
     if (ch == '.')
       substdio_put(&smtpto,".",1);
     while (ch != '\n') {
-      substdio_put(&smtpto,&ch,1);
+
+      // we're looking for a "X-QmailLog" header...
+      // if we find one, we output its value to STDOUT
+      // and bypass the SMTP data stream...
+      char tmp_buf[12] = {0};
+
+      if (in_headers && cnt==0)
+      {
+        tmp_buf[cnt++] = ch;
+
+        while (cnt < 11)
+        {
+          r = substdio_get (&ssin, &ch, 1);
+
+          if (r == 0 || r == -1)
+          {
+            substdio_put (&smtpto, tmp_buf, cnt);
+
+            if (r == 0)
+              perm_partialline ();
+            else
+              temp_read ();
+          }
+          else if (ch == '\n')
+          {
+            substdio_put (&smtpto, tmp_buf, cnt);
+
+            goto nextline;
+          }
+
+          tmp_buf[cnt++] = ch;
+        }
+
+        if (cnt == 11 && strnicmp(tmp_buf, "X-QmailLog:", 11) == 0)
+        {
+          int valuestarted = 0;
+          in_headers = 0;
+
+          while (1)
+          {
+            r = substdio_get (&ssin, &ch, 1);
+
+            if (r == 0)
+              perm_partialline ();
+            if (r == -1)
+              temp_read ();
+
+            if (ch == '\n')
+              break;
+            else if (!valuestarted && (ch == ' ' || ch == '\t'))
+              ;
+            else
+            {
+              valuestarted = 1;
+              if (!stralloc_append(&logtext,&ch)) temp_nomem();
+            }
+          }
+        }
+        else
+        {
+          substdio_put (&smtpto, tmp_buf, cnt);
+        }
+
+      }
+      else                                        // ... //
+      {                                           // ... //
+        substdio_put(&smtpto,&ch,1);
+      }
+
       r = substdio_get(&ssin,&ch,1);
+      ++cnt;
+
       if (r == 0) perm_partialline();
       if (r == -1) temp_read();
     }
+
+    if (cnt == 0) in_headers = 0;
+
+nextline:
     substdio_put(&smtpto,"\r\n",2);
   }
- 
+
   flagcritical = 1;
   substdio_put(&smtpto,".\r\n",3);
   substdio_flush(&smtpto);
